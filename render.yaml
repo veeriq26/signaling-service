@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: veeriq-signaling
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: VEERIQ_SIGNAL_PROXY_TLS
+        value: "true"
+      - key: RUST_LOG
+        value: info
