@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -33,6 +33,15 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 const MAX_SIGNAL_TEXT_CHARS: usize = 48 * 1024;
+const PAIRING_CODE_TTL: Duration = Duration::from_secs(5 * 60);
+const PAIRING_REQUEST_TTL: Duration = Duration::from_secs(60);
+const PAIRING_RATE_WINDOW: Duration = Duration::from_secs(60);
+const PAIRING_REQUEST_ID_RETENTION: Duration = Duration::from_secs(10 * 60);
+const MAX_PAIRING_ATTEMPTS_PER_MINUTE: usize = 5;
+const MAX_GLOBAL_PAIRING_ATTEMPTS_PER_MINUTE: usize = 60;
+const MAX_GLOBAL_PAIRING_CREATES_PER_MINUTE: usize = 30;
+const MAX_PAIRING_CODES: usize = 128;
+const MAX_PAIRING_REQUEST_IDS: usize = 2048;
 
 #[derive(Clone)]
 pub struct ServiceState {
@@ -40,11 +49,47 @@ pub struct ServiceState {
     slots: Arc<Semaphore>,
     shutdown: CancellationToken,
     turn_credentials: Option<TurnCredentialProvider>,
+    pairings: Arc<Mutex<PairingRegistry>>,
 }
 
 struct ConnectionHandle {
     sender: mpsc::Sender<Message>,
     connection_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingIdentity {
+    fingerprint: String,
+    public_key: String,
+    display_name: String,
+}
+
+#[derive(Clone)]
+struct PairingOffer {
+    owner: PairingIdentity,
+    owner_connection_id: u64,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPairing {
+    owner: PairingIdentity,
+    requester: PairingIdentity,
+    owner_connection_id: u64,
+    requester_connection_id: u64,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct PairingRegistry {
+    offers: HashMap<String, PairingOffer>,
+    pending: HashMap<String, PendingPairing>,
+    create_attempts: HashMap<String, VecDeque<Instant>>,
+    join_attempts: HashMap<String, VecDeque<Instant>>,
+    global_create_attempts: VecDeque<Instant>,
+    global_join_attempts: VecDeque<Instant>,
+    used_request_ids: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +108,17 @@ enum ClientMessage {
     Relay {
         target_fingerprint: String,
         message: PeerSignal,
+    },
+    PairingCreate {
+        request_id: String,
+    },
+    PairingJoin {
+        request_id: String,
+        code: String,
+    },
+    PairingDecision {
+        request_id: String,
+        approved: bool,
     },
 }
 
@@ -125,6 +181,26 @@ enum ServerMessage {
         from_fingerprint: String,
         message: PeerSignal,
     },
+    PairingCode {
+        request_id: String,
+        code: String,
+        expires_at: u64,
+    },
+    PairingRequest {
+        request_id: String,
+        peer: PairingIdentity,
+        expires_at: u64,
+    },
+    PairingResult {
+        request_id: String,
+        status: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<PairingIdentity>,
+    },
+    PairingError {
+        request_id: String,
+        code: &'static str,
+    },
     Error {
         code: &'static str,
     },
@@ -137,9 +213,257 @@ impl ServiceState {
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             shutdown,
             turn_credentials: None,
+            pairings: Arc::new(Mutex::new(PairingRegistry::default())),
         }
     }
+}
 
+impl PairingRegistry {
+    fn prune(&mut self, now: Instant) {
+        self.offers.retain(|_, offer| offer.expires_at > now);
+        self.used_request_ids
+            .retain(|_, expires_at| *expires_at > now);
+        for attempts in self.create_attempts.values_mut() {
+            prune_attempts(attempts, now);
+        }
+        self.create_attempts
+            .retain(|_, attempts| !attempts.is_empty());
+        for attempts in self.join_attempts.values_mut() {
+            prune_attempts(attempts, now);
+        }
+        self.join_attempts
+            .retain(|_, attempts| !attempts.is_empty());
+        prune_attempts(&mut self.global_create_attempts, now);
+        prune_attempts(&mut self.global_join_attempts, now);
+    }
+
+    fn remove_connection(
+        &mut self,
+        fingerprint: &str,
+        now: Instant,
+    ) -> Vec<(String, PendingPairing)> {
+        self.prune(now);
+        self.offers
+            .retain(|_, offer| offer.owner.fingerprint != fingerprint);
+        let expired = self
+            .pending
+            .iter()
+            .filter(|(_, request)| {
+                request.owner.fingerprint == fingerprint
+                    || request.requester.fingerprint == fingerprint
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|request_id| {
+                self.pending
+                    .remove(&request_id)
+                    .map(|request| (request_id, request))
+            })
+            .collect()
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<(String, PendingPairing)> {
+        self.prune(now);
+        let expired = self
+            .pending
+            .iter()
+            .filter(|(_, request)| request.expires_at <= now)
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|request_id| {
+                self.pending
+                    .remove(&request_id)
+                    .map(|request| (request_id, request))
+            })
+            .collect()
+    }
+
+    fn create(
+        &mut self,
+        owner: PairingIdentity,
+        connection_id: u64,
+        request_id: &str,
+        code: String,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        self.prune(now);
+        let global_attempts = &mut self.global_create_attempts;
+        if global_attempts.len() >= MAX_GLOBAL_PAIRING_CREATES_PER_MINUTE {
+            return Err("rate-limited");
+        }
+        global_attempts.push_back(now);
+        if !valid_request_id(request_id) {
+            return Err("invalid-request");
+        }
+        let attempts = self
+            .create_attempts
+            .entry(owner.fingerprint.clone())
+            .or_default();
+        prune_attempts(attempts, now);
+        if attempts.len() >= 3 {
+            return Err("rate-limited");
+        }
+        attempts.push_back(now);
+        if !valid_pairing_code(&code)
+            || self.offers.len() >= MAX_PAIRING_CODES
+            || self.offers.contains_key(&code)
+            || self
+                .offers
+                .values()
+                .any(|offer| offer.owner.fingerprint == owner.fingerprint)
+            || self.pending.values().any(|request| {
+                request.owner.fingerprint == owner.fingerprint
+                    || request.requester.fingerprint == owner.fingerprint
+            })
+        {
+            return Err("pairing-unavailable");
+        }
+        self.reserve_request_id(request_id, now)?;
+        self.offers.insert(
+            code,
+            PairingOffer {
+                owner,
+                owner_connection_id: connection_id,
+                expires_at: now + PAIRING_CODE_TTL,
+            },
+        );
+        Ok(())
+    }
+
+    fn join(
+        &mut self,
+        requester: PairingIdentity,
+        requester_connection_id: u64,
+        request_id: &str,
+        code: &str,
+        now: Instant,
+    ) -> Result<PendingPairing, &'static str> {
+        self.prune(now);
+        if self.global_join_attempts.len() >= MAX_GLOBAL_PAIRING_ATTEMPTS_PER_MINUTE {
+            return Err("rate-limited");
+        }
+        self.global_join_attempts.push_back(now);
+        let attempts = self
+            .join_attempts
+            .entry(requester.fingerprint.clone())
+            .or_default();
+        prune_attempts(attempts, now);
+        if attempts.len() >= MAX_PAIRING_ATTEMPTS_PER_MINUTE {
+            return Err("rate-limited");
+        }
+        attempts.push_back(now);
+        if !valid_request_id(request_id) || !valid_pairing_code(code) {
+            if !valid_request_id(request_id) {
+                return Err("invalid-code");
+            }
+            self.reserve_request_id(request_id, now)?;
+            return Err("invalid-code");
+        }
+        self.reserve_request_id(request_id, now)?;
+        if self.pending.contains_key(request_id) {
+            return Err("duplicate-request");
+        }
+        if self.pending.values().any(|request| {
+            request.owner.fingerprint == requester.fingerprint
+                || request.requester.fingerprint == requester.fingerprint
+        }) {
+            return Err("duplicate-request");
+        }
+        let offer = self.offers.remove(code).ok_or("invalid-or-expired-code")?;
+        if offer.owner.fingerprint == requester.fingerprint {
+            return Err("invalid-or-expired-code");
+        }
+        let pending = PendingPairing {
+            owner: offer.owner,
+            requester,
+            owner_connection_id: offer.owner_connection_id,
+            requester_connection_id,
+            expires_at: now + PAIRING_REQUEST_TTL,
+        };
+        self.pending.insert(
+            request_id.to_owned(),
+            PendingPairing {
+                owner: pending.owner.clone(),
+                requester: pending.requester.clone(),
+                owner_connection_id: pending.owner_connection_id,
+                requester_connection_id: pending.requester_connection_id,
+                expires_at: pending.expires_at,
+            },
+        );
+        Ok(pending)
+    }
+
+    fn reserve_request_id(&mut self, request_id: &str, now: Instant) -> Result<(), &'static str> {
+        if self.used_request_ids.contains_key(request_id) {
+            return Err("duplicate-request");
+        }
+        if self.used_request_ids.len() >= MAX_PAIRING_REQUEST_IDS {
+            return Err("temporarily-unavailable");
+        }
+        self.used_request_ids
+            .insert(request_id.to_owned(), now + PAIRING_REQUEST_ID_RETENTION);
+        Ok(())
+    }
+
+    fn decide(
+        &mut self,
+        owner_fingerprint: &str,
+        owner_connection_id: u64,
+        request_id: &str,
+        _approved: bool,
+        now: Instant,
+    ) -> Result<PendingPairing, &'static str> {
+        self.prune(now);
+        let request = self.pending.get(request_id).ok_or("pairing-not-pending")?;
+        if request.expires_at <= now {
+            return Err("pairing-expired");
+        }
+        if request.owner.fingerprint != owner_fingerprint
+            || request.owner_connection_id != owner_connection_id
+        {
+            return Err("not-pairing-owner");
+        }
+        self.pending.remove(request_id).ok_or("pairing-not-pending")
+    }
+}
+
+fn prune_attempts(attempts: &mut VecDeque<Instant>, now: Instant) {
+    while attempts
+        .front()
+        .is_some_and(|at| now.duration_since(*at) >= PAIRING_RATE_WINDOW)
+    {
+        attempts.pop_front();
+    }
+}
+
+fn valid_pairing_code(code: &str) -> bool {
+    code.len() == 8 && code.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_request_id(request_id: &str) -> bool {
+    request_id.len() == 32
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn random_pairing_code() -> Result<String, &'static str> {
+    let mut bytes = [0_u8; 4];
+    random_fill(&mut bytes).map_err(|_| "temporarily-unavailable")?;
+    Ok(format!("{:08}", u32::from_le_bytes(bytes) % 100_000_000))
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+impl ServiceState {
     pub fn with_turn_credentials(mut self, provider: Option<TurnCredentialProvider>) -> Self {
         self.turn_credentials = provider;
         self
@@ -148,13 +472,8 @@ impl ServiceState {
     pub fn router(self) -> Router {
         Router::new()
             .route("/signal", get(upgrade))
-            .route("/healthz", get(health_check))
             .with_state(self)
     }
-}
-
-async fn health_check() -> StatusCode {
-    StatusCode::NO_CONTENT
 }
 
 pub fn signaling_auth_message(nonce: &[u8; 32]) -> Vec<u8> {
@@ -234,6 +553,11 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
         let _ = send_error(&mut socket, "invalid-device-proof").await;
         return;
     };
+    let identity = PairingIdentity {
+        fingerprint: fingerprint.clone(),
+        public_key: public_key.to_ascii_lowercase(),
+        display_name: display_name.clone(),
+    };
     let ice_servers = match state.turn_credentials.as_ref() {
         Some(provider) => match issue_current(provider, &fingerprint) {
             Ok(credentials) => vec![credentials],
@@ -280,9 +604,14 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
     }
 
     let mut recent_messages = VecDeque::new();
+    let mut cleanup = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
+            _ = cleanup.tick() => cleanup_expired_pairings(&state).await,
             outgoing = receiver.recv() => {
                 match outgoing {
                     Some(message) => {
@@ -310,42 +639,77 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
                             break;
                         }
                         recent_messages.push_back(now);
-                        let Ok(ClientMessage::Relay { target_fingerprint, message }) =
-                            serde_json::from_str(text.as_str())
-                        else {
+                        let Ok(client_message) = serde_json::from_str::<ClientMessage>(text.as_str()) else {
                             let _ = send_error(&mut socket, "invalid-message").await;
                             break;
                         };
-                        if !valid_fingerprint(&target_fingerprint) || !valid_signal(&message) {
-                            let _ = send_error(&mut socket, "invalid-message").await;
-                            break;
-                        }
-                        let payload = match serde_json::to_string(&ServerMessage::Relay {
-                            from_fingerprint: fingerprint.clone(),
-                            message,
-                        }) {
-                            Ok(payload) => Message::Text(payload.into()),
-                            Err(_) => {
-                                let _ = send_error(&mut socket, "temporarily-unavailable").await;
-                                break;
+                        match client_message {
+                            ClientMessage::Relay { target_fingerprint, message } => {
+                                if !valid_fingerprint(&target_fingerprint) || !valid_signal(&message) {
+                                    let _ = send_error(&mut socket, "invalid-message").await;
+                                    break;
+                                }
+                                let payload = match serde_json::to_string(&ServerMessage::Relay {
+                                    from_fingerprint: fingerprint.clone(),
+                                    message,
+                                }) {
+                                    Ok(payload) => Message::Text(payload.into()),
+                                    Err(_) => {
+                                        let _ = send_error(&mut socket, "temporarily-unavailable").await;
+                                        break;
+                                    }
+                                };
+                                let target_result = {
+                                    match state.connections.lock() {
+                                        Ok(connections) => Ok(connections.get(&target_fingerprint)
+                                            .map(|handle| handle.sender.clone())),
+                                        Err(_) => Err(()),
+                                    }
+                                };
+                                let target = match target_result {
+                                    Ok(target) => target,
+                                    Err(_) => {
+                                        let _ = send_error(&mut socket, "temporarily-unavailable").await;
+                                        break;
+                                    }
+                                };
+                                match target {
+                                    Some(target) if target.send(payload).await.is_ok() => {}
+                                    _ => {
+                                        let _ = send_error(&mut socket, "peer-unavailable").await;
+                                    }
+                                }
                             }
-                        };
-                        let (lock_ok, target) = match state.connections.lock() {
-                            Ok(connections) => (
-                                true,
-                                connections.get(&target_fingerprint)
-                                    .map(|handle| handle.sender.clone()),
-                            ),
-                            Err(_) => (false, None),
-                        };
-                        if !lock_ok {
-                            let _ = send_error(&mut socket, "temporarily-unavailable").await;
-                            break;
-                        };
-                        match target {
-                            Some(target) if target.send(payload).await.is_ok() => {}
-                            _ => {
-                                let _ = send_error(&mut socket, "peer-unavailable").await;
+                            ClientMessage::PairingCreate { request_id } => {
+                                handle_pairing_create(
+                                    &state,
+                                    &identity,
+                                    connection_id,
+                                    &request_id,
+                                    &fingerprint,
+                                ).await;
+                            }
+                            ClientMessage::PairingJoin { request_id, code } => {
+                                handle_pairing_join(
+                                    &state,
+                                    &identity,
+                                    connection_id,
+                                    &request_id,
+                                    &code,
+                                ).await;
+                            }
+                            ClientMessage::PairingDecision { request_id, approved } => {
+                                handle_pairing_decision(
+                                    &state,
+                                    &identity,
+                                    connection_id,
+                                    &request_id,
+                                    approved,
+                                ).await;
+                            }
+                            ClientMessage::Authenticate { .. } => {
+                                let _ = send_error(&mut socket, "already-authenticated").await;
+                                break;
                             }
                         }
                     }
@@ -364,6 +728,267 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
         }
     }
     remove_connection(&state, &fingerprint, connection_id);
+    cleanup_disconnected_pairings(&state, &fingerprint).await;
+}
+
+async fn handle_pairing_create(
+    state: &ServiceState,
+    owner: &PairingIdentity,
+    connection_id: u64,
+    request_id: &str,
+    fingerprint: &str,
+) {
+    let now = Instant::now();
+    let created = match state.pairings.lock() {
+        Ok(mut registry) => {
+            let mut result: Result<String, &'static str> = Err("pairing-unavailable");
+            for _ in 0..3 {
+                let Ok(code) = random_pairing_code() else {
+                    result = Err("temporarily-unavailable");
+                    break;
+                };
+                match registry.create(owner.clone(), connection_id, request_id, code.clone(), now) {
+                    Ok(()) => {
+                        result = Ok(code);
+                        break;
+                    }
+                    Err(error) => result = Err(error),
+                }
+            }
+            result
+        }
+        Err(_) => Err("temporarily-unavailable"),
+    };
+    match created {
+        Ok(code) => {
+            let sent = send_to_connection(
+                state,
+                fingerprint,
+                connection_id,
+                ServerMessage::PairingCode {
+                    request_id: request_id.to_owned(),
+                    code,
+                    expires_at: unix_time_seconds() + PAIRING_CODE_TTL.as_secs(),
+                },
+            )
+            .await;
+            if !sent {
+                if let Ok(mut registry) = state.pairings.lock() {
+                    registry
+                        .offers
+                        .retain(|_, offer| offer.owner.fingerprint != fingerprint);
+                }
+            }
+        }
+        Err(code) => {
+            send_pairing_error(state, fingerprint, connection_id, request_id, code).await;
+        }
+    }
+}
+
+async fn handle_pairing_join(
+    state: &ServiceState,
+    requester: &PairingIdentity,
+    connection_id: u64,
+    request_id: &str,
+    code: &str,
+) {
+    let result = state
+        .pairings
+        .lock()
+        .map_err(|_| "temporarily-unavailable")
+        .and_then(|mut registry| {
+            registry.join(
+                requester.clone(),
+                connection_id,
+                request_id,
+                code,
+                Instant::now(),
+            )
+        });
+    match result {
+        Ok(pending) => {
+            let message = ServerMessage::PairingRequest {
+                request_id: request_id.to_owned(),
+                peer: pending.requester,
+                expires_at: unix_time_seconds() + PAIRING_REQUEST_TTL.as_secs(),
+            };
+            if !send_to_connection(
+                state,
+                &pending.owner.fingerprint,
+                pending.owner_connection_id,
+                message,
+            )
+            .await
+            {
+                if let Ok(mut registry) = state.pairings.lock() {
+                    registry.pending.remove(request_id);
+                }
+                send_pairing_error(
+                    state,
+                    &requester.fingerprint,
+                    connection_id,
+                    request_id,
+                    "peer-unavailable",
+                )
+                .await;
+            }
+        }
+        Err(code) => {
+            send_pairing_error(
+                state,
+                &requester.fingerprint,
+                connection_id,
+                request_id,
+                code,
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_pairing_decision(
+    state: &ServiceState,
+    owner: &PairingIdentity,
+    connection_id: u64,
+    request_id: &str,
+    approved: bool,
+) {
+    let result = state
+        .pairings
+        .lock()
+        .map_err(|_| "temporarily-unavailable")
+        .and_then(|mut registry| {
+            registry.decide(
+                &owner.fingerprint,
+                connection_id,
+                request_id,
+                approved,
+                Instant::now(),
+            )
+        });
+    let pending = match result {
+        Ok(pending) => pending,
+        Err(code) => {
+            send_pairing_error(state, &owner.fingerprint, connection_id, request_id, code).await;
+            return;
+        }
+    };
+    let status = if approved { "approved" } else { "rejected" };
+    let owner_result = ServerMessage::PairingResult {
+        request_id: request_id.to_owned(),
+        status,
+        peer: approved.then_some(pending.requester.clone()),
+    };
+    let requester_result = ServerMessage::PairingResult {
+        request_id: request_id.to_owned(),
+        status,
+        peer: approved.then_some(pending.owner.clone()),
+    };
+    let _ = send_to_connection(
+        state,
+        &pending.owner.fingerprint,
+        pending.owner_connection_id,
+        owner_result,
+    )
+    .await;
+    let _ = send_to_connection(
+        state,
+        &pending.requester.fingerprint,
+        pending.requester_connection_id,
+        requester_result,
+    )
+    .await;
+}
+
+async fn cleanup_expired_pairings(state: &ServiceState) {
+    let expired = state
+        .pairings
+        .lock()
+        .map(|mut registry| registry.expire(Instant::now()))
+        .unwrap_or_default();
+    for (request_id, pending) in expired {
+        send_pairing_result_to_both(state, &request_id, "expired", pending).await;
+    }
+}
+
+async fn cleanup_disconnected_pairings(state: &ServiceState, fingerprint: &str) {
+    let removed = state
+        .pairings
+        .lock()
+        .map(|mut registry| registry.remove_connection(fingerprint, Instant::now()))
+        .unwrap_or_default();
+    for (request_id, pending) in removed {
+        send_pairing_result_to_both(state, &request_id, "expired", pending).await;
+    }
+}
+
+async fn send_pairing_result_to_both(
+    state: &ServiceState,
+    request_id: &str,
+    status: &'static str,
+    pending: PendingPairing,
+) {
+    let _ = send_to_connection(
+        state,
+        &pending.owner.fingerprint,
+        pending.owner_connection_id,
+        ServerMessage::PairingResult {
+            request_id: request_id.to_owned(),
+            status,
+            peer: None,
+        },
+    )
+    .await;
+    let _ = send_to_connection(
+        state,
+        &pending.requester.fingerprint,
+        pending.requester_connection_id,
+        ServerMessage::PairingResult {
+            request_id: request_id.to_owned(),
+            status,
+            peer: None,
+        },
+    )
+    .await;
+}
+
+async fn send_pairing_error(
+    state: &ServiceState,
+    fingerprint: &str,
+    connection_id: u64,
+    request_id: &str,
+    code: &'static str,
+) {
+    let _ = send_to_connection(
+        state,
+        fingerprint,
+        connection_id,
+        ServerMessage::PairingError {
+            request_id: request_id.to_owned(),
+            code,
+        },
+    )
+    .await;
+}
+
+async fn send_to_connection(
+    state: &ServiceState,
+    fingerprint: &str,
+    connection_id: u64,
+    message: ServerMessage,
+) -> bool {
+    let sender = state.connections.lock().ok().and_then(|connections| {
+        connections.get(fingerprint).and_then(|handle| {
+            (handle.connection_id == connection_id).then(|| handle.sender.clone())
+        })
+    });
+    let Some(sender) = sender else {
+        return false;
+    };
+    serde_json::to_string(&message)
+        .ok()
+        .is_some_and(|payload| sender.try_send(Message::Text(payload.into())).is_ok())
 }
 
 fn remove_connection(state: &ServiceState, fingerprint: &str, connection_id: u64) {
@@ -466,6 +1091,33 @@ mod tests {
 
     use super::*;
 
+    fn identity(seed: u8, display_name: &str) -> PairingIdentity {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        PairingIdentity {
+            fingerprint: hex::encode(Sha256::digest(public_key)),
+            public_key: hex::encode(public_key),
+            display_name: display_name.into(),
+        }
+    }
+
+    fn request_id(seed: u8) -> String {
+        format!("{seed:02x}{}", "0".repeat(30))
+    }
+
+    fn create_offer(
+        registry: &mut PairingRegistry,
+        owner: PairingIdentity,
+        connection_id: u64,
+        request_id: &str,
+        code: &str,
+        now: Instant,
+    ) {
+        registry
+            .create(owner, connection_id, request_id, code.to_owned(), now)
+            .expect("valid code offer");
+    }
+
     #[test]
     fn verifies_device_proof_and_derives_public_key_fingerprint() {
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -513,6 +1165,269 @@ mod tests {
             request_id: "request-1".into(),
             sdp: "offer\u{0000}".into()
         }));
+    }
+
+    #[test]
+    fn pairing_approval_is_one_time_and_returns_both_authenticated_identities() {
+        let now = Instant::now();
+        let owner = identity(1, "Owner PC");
+        let requester = identity(2, "Requester PC");
+        let mut registry = PairingRegistry::default();
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            11,
+            &request_id(1),
+            "00123456",
+            now,
+        );
+
+        let pending = registry
+            .join(requester.clone(), 22, &request_id(2), "00123456", now)
+            .expect("valid one-time pairing code");
+        assert_eq!(pending.owner, owner);
+        assert_eq!(pending.requester, requester);
+        assert_eq!(
+            registry
+                .decide(&owner.fingerprint, 11, &request_id(2), true, now)
+                .expect("owner approval")
+                .requester
+                .fingerprint,
+            identity(2, "Requester PC").fingerprint
+        );
+        assert_eq!(
+            registry.decide(&owner.fingerprint, 11, &request_id(2), true, now),
+            Err("pairing-not-pending")
+        );
+        assert_eq!(
+            registry.join(identity(3, "Replay"), 33, &request_id(3), "00123456", now),
+            Err("invalid-or-expired-code")
+        );
+    }
+
+    #[test]
+    fn pairing_rejection_is_one_time_and_cannot_be_decided_by_the_requester() {
+        let now = Instant::now();
+        let owner = identity(4, "Owner");
+        let requester = identity(5, "Requester");
+        let mut registry = PairingRegistry::default();
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            14,
+            &request_id(4),
+            "00000001",
+            now,
+        );
+        registry
+            .join(requester.clone(), 15, &request_id(5), "00000001", now)
+            .expect("request");
+
+        assert_eq!(
+            registry.decide(&requester.fingerprint, 15, &request_id(5), true, now),
+            Err("not-pairing-owner")
+        );
+        assert_eq!(
+            registry
+                .decide(&owner.fingerprint, 14, &request_id(5), false, now)
+                .expect("owner rejection")
+                .requester,
+            requester
+        );
+        assert_eq!(
+            registry.decide(&owner.fingerprint, 14, &request_id(5), true, now),
+            Err("pairing-not-pending")
+        );
+    }
+
+    #[test]
+    fn pairing_codes_and_requests_expire_and_cleanup_removes_pending_state() {
+        let now = Instant::now();
+        let owner = identity(6, "Owner");
+        let requester = identity(7, "Requester");
+        let mut registry = PairingRegistry::default();
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            16,
+            &request_id(6),
+            "12345678",
+            now,
+        );
+        assert_eq!(
+            registry.join(
+                requester.clone(),
+                17,
+                &request_id(7),
+                "12345678",
+                now + PAIRING_CODE_TTL
+            ),
+            Err("invalid-or-expired-code")
+        );
+
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            16,
+            &request_id(8),
+            "87654321",
+            now + PAIRING_CODE_TTL,
+        );
+        registry
+            .join(
+                requester.clone(),
+                17,
+                &request_id(9),
+                "87654321",
+                now + PAIRING_CODE_TTL,
+            )
+            .expect("request before expiry");
+        let expired = registry.expire(now + PAIRING_CODE_TTL + PAIRING_REQUEST_TTL);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, request_id(9));
+
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            16,
+            &request_id(10),
+            "11223344",
+            now + Duration::from_secs(600),
+        );
+        registry
+            .join(
+                requester.clone(),
+                17,
+                &request_id(11),
+                "11223344",
+                now + Duration::from_secs(600),
+            )
+            .expect("request for disconnect cleanup");
+        let disconnected =
+            registry.remove_connection(&requester.fingerprint, now + Duration::from_secs(601));
+        assert_eq!(disconnected.len(), 1);
+        assert!(registry.pending.is_empty());
+        assert!(registry.offers.is_empty());
+    }
+
+    #[test]
+    fn invalid_pairing_inputs_duplicate_requests_and_rate_abuse_fail_closed() {
+        let now = Instant::now();
+        let owner = identity(8, "Owner");
+        let requester = identity(9, "Requester");
+        let mut registry = PairingRegistry::default();
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            18,
+            &request_id(8),
+            "00000002",
+            now,
+        );
+        assert_eq!(
+            registry.join(requester.clone(), 19, &request_id(9), "1234", now),
+            Err("invalid-code")
+        );
+        assert_eq!(
+            registry.join(owner.clone(), 18, &request_id(10), "00000002", now),
+            Err("invalid-or-expired-code")
+        );
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            18,
+            &request_id(13),
+            "00000002",
+            now,
+        );
+        registry
+            .join(requester.clone(), 19, &request_id(11), "00000002", now)
+            .expect("first request");
+
+        let second_owner = identity(10, "Second owner");
+        create_offer(
+            &mut registry,
+            second_owner,
+            20,
+            &request_id(12),
+            "00000003",
+            now,
+        );
+        assert_eq!(
+            registry.join(requester.clone(), 19, &request_id(11), "00000003", now),
+            Err("duplicate-request")
+        );
+
+        let rate_limited_requester = identity(11, "Rate requester");
+        for n in 0..MAX_PAIRING_ATTEMPTS_PER_MINUTE {
+            assert_eq!(
+                registry.join(
+                    rate_limited_requester.clone(),
+                    19,
+                    &request_id(60 + n as u8),
+                    "not-a-code",
+                    now,
+                ),
+                Err("invalid-code")
+            );
+        }
+        assert_eq!(
+            registry.join(
+                rate_limited_requester,
+                131,
+                &request_id(70),
+                "00000105",
+                now
+            ),
+            Err("rate-limited")
+        );
+        assert!(!valid_request_id("NOT-AN-ID"));
+        assert!(!valid_pairing_code("1234567x"));
+    }
+
+    #[test]
+    fn pairing_wire_messages_use_bounded_numeric_codes_and_authenticated_peer_data() {
+        let response = ServerMessage::PairingRequest {
+            request_id: request_id(1),
+            peer: identity(2, "Authenticated requester"),
+            expires_at: 1_800_000_060,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["type"], "pairing-request");
+        assert_eq!(value["peer"]["displayName"], "Authenticated requester");
+        assert_eq!(value["peer"]["fingerprint"].as_str().unwrap().len(), 64);
+        assert!(valid_pairing_code("00123456"));
+        assert!(!valid_pairing_code("1234567"));
+        assert!(!valid_pairing_code("1234567a"));
+    }
+
+    #[test]
+    fn global_pairing_attempt_cap_rejects_sybil_style_guessing() {
+        let now = Instant::now();
+        let mut registry = PairingRegistry::default();
+        for index in 0..MAX_GLOBAL_PAIRING_ATTEMPTS_PER_MINUTE {
+            let requester = identity((index % 200 + 1) as u8, "Requester");
+            assert_eq!(
+                registry.join(
+                    requester,
+                    index as u64,
+                    &request_id((index % 200 + 1) as u8),
+                    "not-a-code",
+                    now,
+                ),
+                Err("invalid-code")
+            );
+        }
+        assert_eq!(
+            registry.join(
+                identity(250, "Attacker"),
+                999,
+                &request_id(250),
+                "12345678",
+                now,
+            ),
+            Err("rate-limited")
+        );
     }
 
     #[test]
