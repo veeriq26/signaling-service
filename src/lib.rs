@@ -15,7 +15,7 @@ use axum::{
     routing::get,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use getrandom::fill as random_fill;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +55,7 @@ pub struct ServiceState {
 struct ConnectionHandle {
     sender: mpsc::Sender<Message>,
     connection_id: u64,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -240,17 +241,21 @@ impl PairingRegistry {
     fn remove_connection(
         &mut self,
         fingerprint: &str,
+        connection_id: u64,
         now: Instant,
     ) -> Vec<(String, PendingPairing)> {
         self.prune(now);
-        self.offers
-            .retain(|_, offer| offer.owner.fingerprint != fingerprint);
+        self.offers.retain(|_, offer| {
+            offer.owner.fingerprint != fingerprint || offer.owner_connection_id != connection_id
+        });
         let expired = self
             .pending
             .iter()
             .filter(|(_, request)| {
-                request.owner.fingerprint == fingerprint
-                    || request.requester.fingerprint == fingerprint
+                (request.owner.fingerprint == fingerprint
+                    && request.owner_connection_id == connection_id)
+                    || (request.requester.fingerprint == fingerprint
+                        && request.requester_connection_id == connection_id)
             })
             .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
@@ -570,23 +575,26 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
     };
     let connection_id = u64::from_le_bytes(nonce[..8].try_into().unwrap_or([0; 8]));
     let (sender, mut receiver) = mpsc::channel::<Message>(32);
-    let registration = match state.connections.lock() {
-        Ok(mut connections) if !connections.contains_key(&fingerprint) => {
-            connections.insert(
-                fingerprint.clone(),
-                ConnectionHandle {
-                    sender,
-                    connection_id,
-                },
-            );
-            Ok(())
-        }
-        Ok(_) => Err("device-already-connected"),
+    let connection_cancel = CancellationToken::new();
+    let replaced_connection = match state.connections.lock() {
+        Ok(mut connections) => Ok(replace_connection(
+            &mut connections,
+            &fingerprint,
+            ConnectionHandle {
+                sender,
+                connection_id,
+                cancel: connection_cancel.clone(),
+            },
+        )),
         Err(_) => Err("temporarily-unavailable"),
     };
-    if let Err(code) = registration {
-        let _ = send_error(&mut socket, code).await;
-        return;
+    match replaced_connection {
+        Ok(Some(previous)) => previous.cancel.cancel(),
+        Ok(None) => {}
+        Err(code) => {
+            let _ = send_error(&mut socket, code).await;
+            return;
+        }
     }
 
     if send_json(
@@ -611,6 +619,14 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
+            _ = connection_cancel.cancelled() => {
+                let _ = send_json(
+                    &mut socket,
+                    &ServerMessage::Error { code: "connection-replaced" },
+                ).await;
+                let _ = socket.close().await;
+                break;
+            }
             _ = cleanup.tick() => cleanup_expired_pairings(&state).await,
             outgoing = receiver.recv() => {
                 match outgoing {
@@ -624,6 +640,9 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
             }
             incoming = socket.next() => {
                 let Some(Ok(message)) = incoming else { break };
+                if !is_current_connection(&state, &fingerprint, connection_id) {
+                    break;
+                }
                 match message {
                     Message::Text(text) => {
                         if text.len() > MAX_MESSAGE_BYTES {
@@ -728,7 +747,7 @@ async fn handle_socket(mut socket: WebSocket, state: ServiceState) {
         }
     }
     remove_connection(&state, &fingerprint, connection_id);
-    cleanup_disconnected_pairings(&state, &fingerprint).await;
+    cleanup_disconnected_pairings(&state, &fingerprint, connection_id).await;
 }
 
 async fn handle_pairing_create(
@@ -912,11 +931,15 @@ async fn cleanup_expired_pairings(state: &ServiceState) {
     }
 }
 
-async fn cleanup_disconnected_pairings(state: &ServiceState, fingerprint: &str) {
+async fn cleanup_disconnected_pairings(
+    state: &ServiceState,
+    fingerprint: &str,
+    connection_id: u64,
+) {
     let removed = state
         .pairings
         .lock()
-        .map(|mut registry| registry.remove_connection(fingerprint, Instant::now()))
+        .map(|mut registry| registry.remove_connection(fingerprint, connection_id, Instant::now()))
         .unwrap_or_default();
     for (request_id, pending) in removed {
         send_pairing_result_to_both(state, &request_id, "expired", pending).await;
@@ -993,13 +1016,37 @@ async fn send_to_connection(
 
 fn remove_connection(state: &ServiceState, fingerprint: &str, connection_id: u64) {
     if let Ok(mut connections) = state.connections.lock() {
-        if connections
-            .get(fingerprint)
-            .is_some_and(|handle| handle.connection_id == connection_id)
-        {
-            connections.remove(fingerprint);
-        }
+        remove_connection_from_registry(&mut connections, fingerprint, connection_id);
     }
+}
+
+fn remove_connection_from_registry(
+    connections: &mut HashMap<String, ConnectionHandle>,
+    fingerprint: &str,
+    connection_id: u64,
+) {
+    if connections
+        .get(fingerprint)
+        .is_some_and(|handle| handle.connection_id == connection_id)
+    {
+        connections.remove(fingerprint);
+    }
+}
+
+fn replace_connection(
+    connections: &mut HashMap<String, ConnectionHandle>,
+    fingerprint: &str,
+    connection: ConnectionHandle,
+) -> Option<ConnectionHandle> {
+    connections.insert(fingerprint.to_owned(), connection)
+}
+
+fn is_current_connection(state: &ServiceState, fingerprint: &str, connection_id: u64) -> bool {
+    state.connections.lock().ok().and_then(|connections| {
+        connections
+            .get(fingerprint)
+            .map(|handle| handle.connection_id)
+    }) == Some(connection_id)
 }
 
 fn valid_display_name(name: &str) -> bool {
@@ -1304,10 +1351,66 @@ mod tests {
             )
             .expect("request for disconnect cleanup");
         let disconnected =
-            registry.remove_connection(&requester.fingerprint, now + Duration::from_secs(601));
+            registry.remove_connection(&requester.fingerprint, 17, now + Duration::from_secs(601));
         assert_eq!(disconnected.len(), 1);
         assert!(registry.pending.is_empty());
         assert!(registry.offers.is_empty());
+    }
+
+    #[test]
+    fn stale_connection_cleanup_does_not_remove_replacement_pairing_state() {
+        let now = Instant::now();
+        let owner = identity(10, "Owner");
+        let requester = identity(11, "Requester");
+        let mut registry = PairingRegistry::default();
+        create_offer(
+            &mut registry,
+            owner.clone(),
+            20,
+            &request_id(12),
+            "11223344",
+            now,
+        );
+        registry
+            .join(requester, 21, &request_id(13), "11223344", now)
+            .expect("request on current connections");
+
+        let removed = registry.remove_connection(&owner.fingerprint, 19, now);
+
+        assert!(removed.is_empty());
+        assert!(registry.pending.contains_key(&request_id(13)));
+    }
+
+    #[test]
+    fn replacing_connection_cancels_previous_socket_without_removing_new_entry() {
+        let (old_sender, _) = mpsc::channel(1);
+        let old_cancel = CancellationToken::new();
+        let fingerprint = identity(12, "Device").fingerprint;
+        let mut connections = HashMap::from([(
+            fingerprint.clone(),
+            ConnectionHandle {
+                sender: old_sender,
+                connection_id: 30,
+                cancel: old_cancel.clone(),
+            },
+        )]);
+        let (new_sender, _) = mpsc::channel(1);
+
+        let previous = replace_connection(
+            &mut connections,
+            &fingerprint,
+            ConnectionHandle {
+                sender: new_sender,
+                connection_id: 31,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .expect("previous connection");
+        previous.cancel.cancel();
+        remove_connection_from_registry(&mut connections, &fingerprint, 30);
+
+        assert!(old_cancel.is_cancelled());
+        assert_eq!(connections[&fingerprint].connection_id, 31);
     }
 
     #[test]

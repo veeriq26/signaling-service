@@ -40,7 +40,10 @@ before connecting Render.
    verify WebRTC connectivity.
 5. Connect the desktop client and confirm device authentication. Test
    Allow/Reject and session cleanup on two devices. If there is no STUN/TURN
-   server, direct connectivity may fail on separate networks.
+   server, direct connectivity may fail on separate networks. Reconnect the
+   same device identity from a second app instance and confirm the new
+   authenticated connection replaces the old one; the displaced app should
+   receive `connection-replaced` and must not reconnect automatically.
 
 ## Free-plan limits and security
 
@@ -56,6 +59,10 @@ The server keeps active signaling connections in process memory. Do not scale
 this service to multiple instances: Render can route each WebSocket connection
 to a different instance, while this prototype does not share connection state.
 The free plan uses one instance by default.
+When a device successfully proves its key on a new connection, that connection
+replaces the previous connection for the same fingerprint. This handles stale
+WebSockets without bypassing device authentication; the old client is notified
+and should not automatically reconnect.
 
 Do not place TLS private keys in Render environment variables for this proxy
 mode; Render provides public HTTPS/WSS at the edge. `VEERIQ_SIGNAL_PROXY_TLS`
